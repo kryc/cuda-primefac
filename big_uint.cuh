@@ -1243,6 +1243,49 @@ __host__ __device__ static inline BigUInt<DL> mod_fast(const BigUInt<NL>& numera
         return out;
     }
 
+    // Next hot ranges: denom fits in 2 limbs (<=128-bit) or 4 limbs (<=256-bit).
+    if constexpr (DL >= 4) {
+        bool fitsU128 = true;
+        for (size_t i = 2; i < DL; ++i) {
+            if (denom.limb[i] != 0ull) {
+                fitsU128 = false;
+                break;
+            }
+        }
+        if (fitsU128 && denom.limb[1] != 0ull) {
+            BigUInt<2> d2 = BigUInt<2>::zero();
+            d2.limb[0] = denom.limb[0];
+            d2.limb[1] = denom.limb[1];
+            BigUInt<2> r2 = mod_knuth_fixed_full_streaming<NL, 2>(numerator, d2);
+            BigUInt<DL> out = BigUInt<DL>::zero();
+            out.limb[0] = r2.limb[0];
+            out.limb[1] = r2.limb[1];
+            return out;
+        }
+
+        bool fitsU256 = true;
+        for (size_t i = 4; i < DL; ++i) {
+            if (denom.limb[i] != 0ull) {
+                fitsU256 = false;
+                break;
+            }
+        }
+        if (fitsU256 && denom.limb[3] != 0ull) {
+            BigUInt<4> d4 = BigUInt<4>::zero();
+            d4.limb[0] = denom.limb[0];
+            d4.limb[1] = denom.limb[1];
+            d4.limb[2] = denom.limb[2];
+            d4.limb[3] = denom.limb[3];
+            BigUInt<4> r4 = mod_knuth_fixed_full_streaming<NL, 4>(numerator, d4);
+            BigUInt<DL> out = BigUInt<DL>::zero();
+            out.limb[0] = r4.limb[0];
+            out.limb[1] = r4.limb[1];
+            out.limb[2] = r4.limb[2];
+            out.limb[3] = r4.limb[3];
+            return out;
+        }
+    }
+
     const bool full = (numerator.limb[NL - 1] != 0ull) && (denom.limb[DL - 1] != 0ull);
 
     if constexpr ((NL == 32 && DL == 16) || (NL == 16 && DL == 8) || (NL == 8 && DL == 4) || (NL == 4 && DL == 2)) {
@@ -1273,6 +1316,50 @@ __host__ __device__ static inline void div_mod_fast(const BigUInt<NL>& numerator
         remainder = BigUInt<DL>::zero();
         remainder.limb[0] = rem;
         return;
+    }
+
+    if constexpr (DL >= 4) {
+        bool fitsU128 = true;
+        for (size_t i = 2; i < DL; ++i) {
+            if (denom.limb[i] != 0ull) {
+                fitsU128 = false;
+                break;
+            }
+        }
+        if (fitsU128 && denom.limb[1] != 0ull) {
+            BigUInt<2> d2 = BigUInt<2>::zero();
+            d2.limb[0] = denom.limb[0];
+            d2.limb[1] = denom.limb[1];
+            BigUInt<2> r2;
+            div_mod_knuth<NL, 2>(numerator, d2, quotient, r2);
+            remainder = BigUInt<DL>::zero();
+            remainder.limb[0] = r2.limb[0];
+            remainder.limb[1] = r2.limb[1];
+            return;
+        }
+
+        bool fitsU256 = true;
+        for (size_t i = 4; i < DL; ++i) {
+            if (denom.limb[i] != 0ull) {
+                fitsU256 = false;
+                break;
+            }
+        }
+        if (fitsU256 && denom.limb[3] != 0ull) {
+            BigUInt<4> d4 = BigUInt<4>::zero();
+            d4.limb[0] = denom.limb[0];
+            d4.limb[1] = denom.limb[1];
+            d4.limb[2] = denom.limb[2];
+            d4.limb[3] = denom.limb[3];
+            BigUInt<4> r4;
+            div_mod_knuth<NL, 4>(numerator, d4, quotient, r4);
+            remainder = BigUInt<DL>::zero();
+            remainder.limb[0] = r4.limb[0];
+            remainder.limb[1] = r4.limb[1];
+            remainder.limb[2] = r4.limb[2];
+            remainder.limb[3] = r4.limb[3];
+            return;
+        }
     }
 
     const bool full = (numerator.limb[NL - 1] != 0ull) && (denom.limb[DL - 1] != 0ull);

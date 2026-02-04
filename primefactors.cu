@@ -2,8 +2,10 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <math.h>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <cuda.h>
@@ -25,6 +27,57 @@ using Big = bigu::BigUInt<kBigLimbs>;
 // Any divisor we test satisfies d <= sqrt(N), so for a fixed-width N this fits in ~half the bits.
 constexpr size_t kDivLimbs = (kBigLimbs + 1u) / 2u;
 using Div = bigu::BigUInt<kDivLimbs>;
+
+static void print_status_line(const std::string& msg)
+{
+    static size_t lastLen = 0;
+    std::cout << "\r" << msg;
+    if (lastLen > msg.size()) {
+        std::cout << std::string(lastLen - msg.size(), ' ');
+    }
+    std::cout << std::flush;
+    lastLen = msg.size();
+}
+
+static long double big_to_long_double_approx(const Div& x)
+{
+    // Convert using up to 3 highest non-zero limbs. Good enough for progress percentages.
+    constexpr long double kTwo64 = 18446744073709551616.0L;
+    long double v = 0.0L;
+    int used = 0;
+    for (size_t i = kDivLimbs; i-- > 0;) {
+        uint64_t w = x.limb[i];
+        if (w == 0 && used == 0) {
+            continue;
+        }
+        v = v * kTwo64 + (long double)w;
+        if (++used >= 3) {
+            break;
+        }
+    }
+    return v;
+}
+
+static double approx_percent_complete(const Div& done, const Div& total)
+{
+    if (total.is_zero()) return 0.0;
+    Div d = done;
+    if (d > total) d = total;
+
+    // Scale both down by the same shift so the approximation stays in-range.
+    uint32_t bl = total.bit_length();
+    uint32_t shift = (bl > 160u) ? (bl - 160u) : 0u;
+    Div ds = d.shr_bits(shift);
+    Div ts = total.shr_bits(shift);
+
+    long double dv = big_to_long_double_approx(ds);
+    long double tv = big_to_long_double_approx(ts);
+    if (tv <= 0.0L) return 0.0;
+    long double p = (dv / tv) * 100.0L;
+    if (p < 0.0L) p = 0.0L;
+    if (p > 100.0L) p = 100.0L;
+    return (double)p;
+}
 
 static bool parse_big_dec(const char* s, Big& out)
 {
@@ -329,6 +382,15 @@ int main(int argc, char** argv)
     checkCuda(cudaMallocManaged(&dSqrtN, sizeof(Div)), "cudaMallocManaged(dSqrtN)");
 
     auto factor_big = [&](auto&& self, Big n, std::vector<Big>& outFactors) -> void {
+        static thread_local int depth = 0;
+        struct DepthGuard {
+            int& d;
+            DepthGuard(int& dd) : d(dd) { ++d; }
+            ~DepthGuard() { --d; }
+        } guard(depth);
+
+        const bool doLog = (depth == 1);
+
         // Fast path: use 64-bit factorization when possible.
         uint64_t n64 = 0;
         if (n.fits_u64(n64)) {
@@ -388,18 +450,13 @@ int main(int argc, char** argv)
                 Div endBlock = start;
                 endBlock.add_u64_inplace(endOffset);
 
-                {
-                    Div candLo = start;
-                    candLo.mul_u32_inplace(kWheelMod);
-                    candLo.add_u32_inplace(1u);
-
-                    Div candHi = endBlock;
-                    candHi.mul_u32_inplace(kWheelMod);
-
-                    std::cout << "\rScanning blocks [" << uint_to_string(start) << "," << uint_to_string(endBlock) << ")"
-                              << " candidates ~[" << uint_to_string(candLo) << "," << uint_to_string(candHi) << "]"
-                              << " (rem=" << uint_to_string(remaining) << ")"
-                              << std::flush;
+                if (doLog) {
+                    const double pct = approx_percent_complete(endBlock, totalWheelBlocks);
+                    std::ostringstream oss;
+                    oss << std::fixed << std::setprecision(2) << pct << "% "
+                        << "blocks [" << uint_to_string(start) << "," << uint_to_string(endBlock) << ")/" << uint_to_string(totalWheelBlocks)
+                        << " rem=" << uint_to_string(remaining);
+                    print_status_line(oss.str());
                 }
 
                 *outCount = 0;
@@ -419,10 +476,14 @@ int main(int argc, char** argv)
                 checkCuda(cudaGetLastError(), "kernel launch");
                 checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(post-kernel)");
 
-                std::cout << "\rScanned blocks [" << uint_to_string(start) << "," << uint_to_string(endBlock) << ")"
-                          << " found " << *outCount << " divisors"
-                          << " (rem=" << uint_to_string(remaining) << ")"
-                          << std::endl;
+                if (doLog) {
+                    const double pct = approx_percent_complete(endBlock, totalWheelBlocks);
+                    std::ostringstream oss;
+                    oss << std::fixed << std::setprecision(2) << pct << "% "
+                        << "blocks [" << uint_to_string(start) << "," << uint_to_string(endBlock) << ")/" << uint_to_string(totalWheelBlocks)
+                        << " found " << *outCount << " rem=" << uint_to_string(remaining);
+                    print_status_line(oss.str());
+                }
 
                 uint32_t found = *outCount;
                 if (found > 0) {
@@ -474,6 +535,10 @@ int main(int argc, char** argv)
                 outFactors.push_back(remaining);
                 break;
             }
+        }
+
+        if (doLog) {
+            std::cout << std::endl;
         }
     };
 

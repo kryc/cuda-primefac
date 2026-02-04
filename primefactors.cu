@@ -104,35 +104,6 @@ static inline uint64_t splitmix64(uint64_t& x)
     return z ^ (z >> 31);
 }
 
-static Div random_offset_below(const Div& limit, uint64_t& rngState)
-{
-    Div r = Div::zero();
-    const uint32_t bl = limit.bit_length();
-    if (bl == 0) {
-        return r;
-    }
-
-    // Fill limbs with PRNG.
-    for (size_t i = 0; i < kDivLimbs; ++i) {
-        r.limb[i] = splitmix64(rngState);
-    }
-
-    // Mask to bit length of limit.
-    const uint32_t top = (bl - 1u) / 64u;
-    const uint32_t bitsInTop = bl - top * 64u;
-    const uint64_t mask = (bitsInTop == 64u) ? ~0ull : ((1ull << bitsInTop) - 1ull);
-    for (size_t i = (size_t)top + 1; i < kDivLimbs; ++i) {
-        r.limb[i] = 0;
-    }
-    r.limb[top] &= mask;
-
-    // Reduce (at most once) because r is in [0,2^bl).
-    if (r >= limit) {
-        r.sub_inplace(limit);
-    }
-    return r;
-}
-
 static long double big_to_long_double_approx(const Div& x)
 {
     // Convert using up to 3 highest non-zero limbs. Good enough for progress percentages.
@@ -651,8 +622,10 @@ int main(int argc, char** argv)
                 Div endBlock = startBlock;
                 endBlock.add_u64_inplace(endOffset);
 
+                // Count attempted work regardless of whether progress logging is enabled.
+                doneBlocks.add_u64_inplace(endOffset);
+
                 if (doLog) {
-                    doneBlocks.add_u64_inplace(endOffset);
                     const double pct = approx_percent_complete(doneBlocks, totalWheelBlocks);
                     std::ostringstream oss;
                     oss << std::fixed << std::setprecision(2) << pct << "% "
@@ -770,34 +743,72 @@ int main(int argc, char** argv)
                     cur.add_u64_inplace(endOffset);
                 }
             } else if (localStrategy == TrialStrategy::Random) {
-                Div start0 = Div::zero();
                 if (warmupLimit < totalWheelBlocks) {
+                    // Pseudo-random permutation of chunk indices, so we bounce around the space
+                    // but still cover it completely if we run to completion.
                     Div span = totalWheelBlocks;
                     span.sub_inplace(warmupLimit);
-                    start0 = random_offset_below(span, rngState);
-                    start0.add_inplace(warmupLimit);
-                } else {
-                    start0 = Div::zero();
-                }
 
-                Div cur = start0;
-                while (cur < totalWheelBlocks && remaining > one) {
-                    uint64_t endOffset = chunk_len(cur, totalWheelBlocks);
-                    if (run_chunk(cur, endOffset, doneBlocks)) {
-                        foundAny = true;
-                        break;
+                    Div q = Div::zero();
+                    uint64_t r = 0;
+                    bigu::div_mod_u64(span, chunkBlocksThisRound, q, r);
+                    Div totalChunks = q;
+                    if (r != 0) {
+                        totalChunks.add_u64_inplace(1);
                     }
-                    cur.add_u64_inplace(endOffset);
-                }
-                if (!foundAny && (warmupLimit < start0)) {
-                    cur = warmupLimit;
-                    while (cur < start0 && remaining > one) {
-                        uint64_t endOffset = chunk_len(cur, start0);
-                        if (run_chunk(cur, endOffset, doneBlocks)) {
-                            foundAny = true;
-                            break;
+
+                    if (!totalChunks.is_zero()) {
+                        const uint32_t k = totalChunks.bit_length();
+                        auto mask_to_bits = [&](Div& v, uint32_t bits) {
+                            if (bits == 0) {
+                                v = Div::zero();
+                                return;
+                            }
+                            const uint32_t top = (bits - 1u) / 64u;
+                            const uint32_t bitsInTop = bits - top * 64u;
+                            const uint64_t mask = (bitsInTop == 64u) ? ~0ull : ((1ull << bitsInTop) - 1ull);
+                            for (size_t i = (size_t)top + 1; i < kDivLimbs; ++i) {
+                                v.limb[i] = 0;
+                            }
+                            v.limb[top] &= mask;
+                        };
+
+                        // Build a full-period LCG over 2^k.
+                        uint64_t mult = splitmix64(rngState);
+                        mult = (mult & ~3ull) | 1ull; // A ≡ 1 (mod 4)
+                        uint64_t inc = splitmix64(rngState) | 1ull; // B odd
+
+                        Div state = Div::zero();
+                        for (size_t i = 0; i < kDivLimbs; ++i) {
+                            state.limb[i] = splitmix64(rngState);
                         }
-                        cur.add_u64_inplace(endOffset);
+                        mask_to_bits(state, k);
+
+                        auto step = [&]() {
+                            state.mul_u64_inplace(mult);
+                            state.add_u64_inplace(inc);
+                            mask_to_bits(state, k);
+                        };
+
+                        Div chunksDone = Div::zero();
+                        while (chunksDone < totalChunks && remaining > one) {
+                            Div idx;
+                            do {
+                                step();
+                                idx = state;
+                            } while (idx >= totalChunks);
+
+                            Div startBlock = idx;
+                            startBlock.mul_u64_inplace(chunkBlocksThisRound);
+                            startBlock.add_inplace(warmupLimit);
+
+                            uint64_t endOffset = chunk_len(startBlock, totalWheelBlocks);
+                            if (run_chunk(startBlock, endOffset, doneBlocks)) {
+                                foundAny = true;
+                                break;
+                            }
+                            chunksDone.add_u64_inplace(1);
+                        }
                     }
                 }
             } else {

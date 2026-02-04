@@ -12,7 +12,7 @@
 #include "big_uint.cuh"
 
 #ifndef PRIMEFAC_BITS
-#define PRIMEFAC_BITS 256
+#define PRIMEFAC_BITS 2048
 #endif
 
 static_assert(PRIMEFAC_BITS >= 64, "PRIMEFAC_BITS must be >= 64");
@@ -21,6 +21,10 @@ static_assert((PRIMEFAC_BITS % 64) == 0, "PRIMEFAC_BITS must be a multiple of 64
 constexpr size_t kBigBits = (size_t)PRIMEFAC_BITS;
 constexpr size_t kBigLimbs = (kBigBits + 63u) / 64u;
 using Big = bigu::BigUInt<kBigLimbs>;
+
+// Any divisor we test satisfies d <= sqrt(N), so for a fixed-width N this fits in ~half the bits.
+constexpr size_t kDivLimbs = (kBigLimbs + 1u) / 2u;
+using Div = bigu::BigUInt<kDivLimbs>;
 
 static bool parse_big_dec(const char* s, Big& out)
 {
@@ -132,10 +136,11 @@ static std::vector<uint32_t> packWheelGaps510510_5bit(const std::vector<uint8_t>
     return packed;
 }
 
-static inline Big ceil_div_big_by_u32(const Big& a, uint32_t b)
+template <size_t LIMBS>
+static inline bigu::BigUInt<LIMBS> ceil_div_by_u32(const bigu::BigUInt<LIMBS>& a, uint32_t b)
 {
     // Returns ceil(a / b) for 32-bit b > 0.
-    Big t = a;
+    bigu::BigUInt<LIMBS> t = a;
     t.add_u32_inplace(b - 1u);
     (void)t.div_mod_u32_inplace(b);
     return t;
@@ -166,7 +171,8 @@ static void factor_u64(uint64_t n, std::vector<uint64_t>& outPrimeFactors)
     }
 }
 
-static std::string big_to_string(Big v)
+template <size_t LIMBS>
+static std::string uint_to_string(bigu::BigUInt<LIMBS> v)
 {
     if (v.is_zero()) {
         return "0";
@@ -178,6 +184,26 @@ static std::string big_to_string(Big v)
     }
     std::reverse(s.begin(), s.end());
     return s;
+}
+
+static std::string big_to_string(Big v) { return uint_to_string(v); }
+
+static inline Div big_to_div_trunc(const Big& x)
+{
+    Div d = Div::zero();
+    for (size_t i = 0; i < kDivLimbs; ++i) {
+        d.limb[i] = x.limb[i];
+    }
+    return d;
+}
+
+static inline Big div_to_big_zext(const Div& x)
+{
+    Big b = Big::zero();
+    for (size_t i = 0; i < kDivLimbs; ++i) {
+        b.limb[i] = x.limb[i];
+    }
+    return b;
 }
 
 static inline bool big_is_one_or_zero_divisor(uint64_t p) { return p <= 1ull; }
@@ -220,24 +246,24 @@ __device__ __forceinline__ uint32_t wheelGap510510(uint32_t i)
 
 __global__
 void factorize_chunk(const Big* n,
-                     const Big* sqrtn,
-                     Big baseWheelBlock,
+                     const Div* sqrtn,
+                     Div baseWheelBlock,
                      uint64_t startWheelOffset,
                      uint64_t endWheelOffset,
                      uint32_t* outCount,
-                     Big* outDivisors,
+                     Div* outDivisors,
                      uint32_t outCapacity)
 {
     uint64_t idx = (uint64_t)blockIdx.x * (uint64_t)blockDim.x + (uint64_t)threadIdx.x;
     uint64_t stride = (uint64_t)gridDim.x * (uint64_t)blockDim.x;
 
-    const Big one = Big::from_u64(1ull);
+    const Div one = Div::from_u64(1ull);
 
     for (uint64_t wheelOffset = startWheelOffset + idx; wheelOffset < endWheelOffset; wheelOffset += stride) {
-        Big wheelBlock = baseWheelBlock;
+        Div wheelBlock = baseWheelBlock;
         wheelBlock.add_u64_inplace(wheelOffset);
 
-        Big value = wheelBlock;
+        Div value = wheelBlock;
         value.mul_u32_inplace(kWheelMod);
         value.add_u32_inplace(1u);
 
@@ -248,7 +274,7 @@ void factorize_chunk(const Big* n,
             }
 
             if (value > one) {
-                Big r = bigu::mod_big(*n, value);
+                Div r = bigu::mod_fast<kBigLimbs, kDivLimbs>(*n, value);
                 if (r.is_zero()) {
                     uint32_t pos = atomicAdd(outCount, 1u);
                     if (pos < outCapacity) {
@@ -292,15 +318,15 @@ int main(int argc, char** argv)
 
     // Managed buffers used across factorization iterations.
     const int blockSize = 256;
-    const uint32_t outCapacity = 64; // keep small; divisors are big structs
+    const uint32_t outCapacity = 128; // divisors are ~half width of N
     uint32_t* outCount = nullptr;
-    Big* outDivisors = nullptr;
+    Div* outDivisors = nullptr;
     Big* dN = nullptr;
-    Big* dSqrtN = nullptr;
+    Div* dSqrtN = nullptr;
     checkCuda(cudaMallocManaged(&outCount, sizeof(uint32_t)), "cudaMallocManaged(outCount)");
-    checkCuda(cudaMallocManaged(&outDivisors, sizeof(Big) * outCapacity), "cudaMallocManaged(outDivisors)");
+    checkCuda(cudaMallocManaged(&outDivisors, sizeof(Div) * outCapacity), "cudaMallocManaged(outDivisors)");
     checkCuda(cudaMallocManaged(&dN, sizeof(Big)), "cudaMallocManaged(dN)");
-    checkCuda(cudaMallocManaged(&dSqrtN, sizeof(Big)), "cudaMallocManaged(dSqrtN)");
+    checkCuda(cudaMallocManaged(&dSqrtN, sizeof(Div)), "cudaMallocManaged(dSqrtN)");
 
     auto factor_big = [&](auto&& self, Big n, std::vector<Big>& outFactors) -> void {
         // Fast path: use 64-bit factorization when possible.
@@ -339,38 +365,40 @@ int main(int argc, char** argv)
         const uint64_t chunkWheelBlocks = threadsPerLaunch * wheelBlocksPerThread;
 
         const Big one = Big::from_u64(1ull);
-        const Big chunkBig = Big::from_u64(chunkWheelBlocks);
+        const Div oneDiv = Div::from_u64(1ull);
+        const Div chunkDiv = Div::from_u64(chunkWheelBlocks);
 
         while (remaining > one) {
-            Big sqrtn = isqrt_big(remaining);
-            Big totalWheelBlocks = ceil_div_big_by_u32(sqrtn, kWheelMod);
+            Big sqrtnBig = isqrt_big(remaining);
+            Div sqrtn = big_to_div_trunc(sqrtnBig);
+            Div totalWheelBlocks = ceil_div_by_u32(sqrtn, kWheelMod);
 
             bool foundAny = false;
-            Big start = Big::zero();
+            Div start = Div::zero();
             while (start < totalWheelBlocks && remaining > one) {
-                Big blocksLeft = totalWheelBlocks;
+                Div blocksLeft = totalWheelBlocks;
                 blocksLeft.sub_inplace(start);
 
                 uint64_t endOffset = chunkWheelBlocks;
-                if (blocksLeft < chunkBig) {
+                if (blocksLeft < chunkDiv) {
                     // blocksLeft fits in u64 because it's < chunkWheelBlocks (u64).
                     endOffset = blocksLeft.limb[0];
                 }
 
-                Big endBlock = start;
+                Div endBlock = start;
                 endBlock.add_u64_inplace(endOffset);
 
                 {
-                    Big candLo = start;
+                    Div candLo = start;
                     candLo.mul_u32_inplace(kWheelMod);
                     candLo.add_u32_inplace(1u);
 
-                    Big candHi = endBlock;
+                    Div candHi = endBlock;
                     candHi.mul_u32_inplace(kWheelMod);
 
-                    std::cout << "\rScanning blocks [" << big_to_string(start) << "," << big_to_string(endBlock) << ")"
-                              << " candidates ~[" << big_to_string(candLo) << "," << big_to_string(candHi) << "]"
-                              << " (rem=" << big_to_string(remaining) << ")"
+                    std::cout << "\rScanning blocks [" << uint_to_string(start) << "," << uint_to_string(endBlock) << ")"
+                              << " candidates ~[" << uint_to_string(candLo) << "," << uint_to_string(candHi) << "]"
+                              << " (rem=" << uint_to_string(remaining) << ")"
                               << std::flush;
                 }
 
@@ -391,35 +419,37 @@ int main(int argc, char** argv)
                 checkCuda(cudaGetLastError(), "kernel launch");
                 checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(post-kernel)");
 
-                std::cout << "\rScanned blocks [" << big_to_string(start) << "," << big_to_string(endBlock) << ")"
+                std::cout << "\rScanned blocks [" << uint_to_string(start) << "," << uint_to_string(endBlock) << ")"
                           << " found " << *outCount << " divisors"
-                          << " (rem=" << big_to_string(remaining) << ")"
+                          << " (rem=" << uint_to_string(remaining) << ")"
                           << std::endl;
 
                 uint32_t found = *outCount;
                 if (found > 0) {
                     uint32_t toProcess = std::min(found, outCapacity);
                     for (uint32_t i = 0; i < toProcess; ++i) {
-                        Big d = outDivisors[i];
-                        Big r = bigu::mod_big(remaining, d);
-                        if (d > one && r.is_zero()) {
+                        Div d = outDivisors[i];
+                        Div r = bigu::mod_fast<kBigLimbs, kDivLimbs>(remaining, d);
+                        if (d > oneDiv && r.is_zero()) {
                             foundAny = true;
 
                             // Factor the divisor fully (it may be composite). If it divides multiple times,
                             // repeat those prime factors for each division.
+                            Big dBig = div_to_big_zext(d);
                             std::vector<Big> divFactors;
-                            self(self, d, divFactors);
+                            self(self, dBig, divFactors);
 
                             while (true) {
-                                Big rr = bigu::mod_big(remaining, d);
+                                Div rr = bigu::mod_fast<kBigLimbs, kDivLimbs>(remaining, d);
                                 if (!rr.is_zero()) {
                                     break;
                                 }
                                 for (const auto& pf : divFactors) {
                                     outFactors.push_back(pf);
                                 }
-                                Big q, rem;
-                                bigu::div_mod_big(remaining, d, q, rem);
+                                Big q;
+                                Div rem;
+                                bigu::div_mod_fast<kBigLimbs, kDivLimbs>(remaining, d, q, rem);
                                 remaining = q;
                             }
 

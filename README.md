@@ -31,6 +31,9 @@ nvcc -std=c++20 -O2 -DPRIMEFAC_BITS=256 primefactors.cu -o primefactors
 # Tune non-linear strategies without recompiling (values are in wheel-blocks)
 ./primefactors --strategy random --warmup-blocks 8192 --strategy-chunk-blocks 4096 213679575440397248358775931752856
 
+# Make random strategy reproducible
+./primefactors --strategy random --seed 12345 213679575440397248358775931752856
+
 Scanned blocks [0,524288) found 14 divisors (rem=26709946930049656044846991469107)46991469107)
 GPU found divisor: 53
 GPU found divisor: 2660113

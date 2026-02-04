@@ -436,6 +436,8 @@ int main(int argc, char** argv)
     const char* nArg = nullptr;
     uint64_t warmupBlocksOpt = 4096ull;
     uint64_t strategyChunkBlocksOpt = 8192ull;
+    uint64_t seedOpt = 0;
+    bool seedProvided = false;
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -478,6 +480,26 @@ int main(int argc, char** argv)
             strategyChunkBlocksOpt = v;
             continue;
         }
+        if (std::strncmp(a, "--seed", 6) == 0) {
+            const char* valp = nullptr;
+            if (a[6] == '=') {
+                valp = a + 7;
+            } else {
+                if (i + 1 >= argc) {
+                    std::cerr << "Missing value for --seed" << std::endl;
+                    return 1;
+                }
+                valp = argv[++i];
+            }
+            uint64_t v = 0;
+            if (!parse_u64_arg(valp, v)) {
+                std::cerr << "Invalid --seed value: " << valp << std::endl;
+                return 1;
+            }
+            seedOpt = v;
+            seedProvided = true;
+            continue;
+        }
         if (std::strncmp(a, "--strategy", 10) == 0) {
             std::string val;
             if (a[10] == '=') {
@@ -512,6 +534,7 @@ int main(int argc, char** argv)
                   << " [--strategy linear|random|mitm]"
                   << " [--warmup-blocks <wheelBlocks>]"
                   << " [--strategy-chunk-blocks <wheelBlocks>]"
+                  << " [--seed <u64>]"
                   << " <N (decimal, >=2)>" << std::endl;
         return 1;
     }
@@ -573,7 +596,9 @@ int main(int argc, char** argv)
         Big remaining = n;
 
         // PRNG state for random strategy (deterministic per factoring call).
-        uint64_t rngState = 0x6a09e667f3bcc909ull;
+        uint64_t rngState = seedProvided ? seedOpt : 0x6a09e667f3bcc909ull;
+        // Mix in the current remaining so different inputs still produce different sequences,
+        // while remaining reproducible for a given (seed, N).
         rngState ^= remaining.limb[0];
         if constexpr (kBigLimbs > 1) rngState ^= remaining.limb[1] * 0x9e3779b97f4a7c15ull;
         if constexpr (kBigLimbs > 2) rngState ^= remaining.limb[2] * 0xbf58476d1ce4e5b9ull;

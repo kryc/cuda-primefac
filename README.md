@@ -4,11 +4,20 @@
 
 This is a CUDA implementation of trial division prime factorisation. It is capable of finding prime factors for numbers up to 2^128. It works by first building and packing a factorisation wheel with a 510510 modulus (2⋅3⋅5⋅7⋅11⋅13⋅17). It then calculates the search space (0 - √N) and breaks it up into blocks. It dispatches each block to the GPU for trial division.
 
+The integer type used for N is a fixed-width multi-limb big integer (base 2^64) that is compile-time configurable. By default it is built as a 256-bit unsigned integer.
+
 ## Build
 
 ```bash
 sudo apt install nvidia-cuda-toolkit
 nvcc -std=c++20 -O2 primefactors.cu -o primefactors
+
+# Optional: set the bit-width (must be a multiple of 64).
+# Examples:
+#   -DPRIMEFAC_BITS=128  -> 2 limbs
+#   -DPRIMEFAC_BITS=256  -> 4 limbs (default)
+#   -DPRIMEFAC_BITS=512  -> 8 limbs
+nvcc -std=c++20 -O2 -DPRIMEFAC_BITS=256 primefactors.cu -o primefactors
 ```
 
 ### Usage

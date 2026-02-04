@@ -1,6 +1,5 @@
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -10,22 +9,39 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-static bool parse_u128_dec(const char* s, __uint128_t& out)
+#include "big_uint.cuh"
+
+#ifndef PRIMEFAC_BITS
+#define PRIMEFAC_BITS 256
+#endif
+
+static_assert(PRIMEFAC_BITS >= 64, "PRIMEFAC_BITS must be >= 64");
+static_assert((PRIMEFAC_BITS % 64) == 0, "PRIMEFAC_BITS must be a multiple of 64");
+
+constexpr size_t kBigBits = (size_t)PRIMEFAC_BITS;
+constexpr size_t kBigLimbs = (kBigBits + 63u) / 64u;
+using Big = bigu::BigUInt<kBigLimbs>;
+
+static bool parse_big_dec(const char* s, Big& out)
 {
     if (s == nullptr || *s == '\0') {
         return false;
     }
-    __uint128_t value = 0;
+
+    Big value = Big::zero();
     for (const unsigned char* p = (const unsigned char*)s; *p; ++p) {
         if (*p < '0' || *p > '9') {
             return false;
         }
         uint32_t digit = (uint32_t)(*p - '0');
-        // Check overflow for value = value*10 + digit.
-        if (value > (((__uint128_t)(-1) - digit) / 10)) {
+
+        // value = value * 10 + digit, with fixed-width overflow detection.
+        if (value.mul_u32_inplace(10)) {
             return false;
         }
-        value = value * 10 + digit;
+        if (value.add_u32_inplace(digit)) {
+            return false;
+        }
     }
     out = value;
     return true;
@@ -116,29 +132,18 @@ static std::vector<uint32_t> packWheelGaps510510_5bit(const std::vector<uint8_t>
     return packed;
 }
 
-static inline uint64_t ceil_div_u128_to_u64(__uint128_t a, uint64_t b)
+static inline Big ceil_div_big_by_u32(const Big& a, uint32_t b)
 {
-    // Returns ceil(a / b) as uint64_t (assumes result fits in uint64_t).
-    return (uint64_t)((a + (b - 1)) / b);
+    // Returns ceil(a / b) for 32-bit b > 0.
+    Big t = a;
+    t.add_u32_inplace(b - 1u);
+    (void)t.div_mod_u32_inplace(b);
+    return t;
 }
 
-static uint64_t isqrt_u128(__uint128_t n)
+static inline Big isqrt_big(const Big& n)
 {
-    // Exact floor(sqrt(n)) for n up to 2^128-1.
-    uint64_t lo = 0;
-    uint64_t hi = ~0ull;
-    uint64_t ans = 0;
-    while (lo <= hi) {
-        uint64_t mid = lo + ((hi - lo) >> 1);
-        __uint128_t sq = (__uint128_t)mid * (__uint128_t)mid;
-        if (sq <= n) {
-            ans = mid;
-            lo = mid + 1;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    return ans;
+    return bigu::isqrt_big(n);
 }
 
 static void factor_u64(uint64_t n, std::vector<uint64_t>& outPrimeFactors)
@@ -161,19 +166,31 @@ static void factor_u64(uint64_t n, std::vector<uint64_t>& outPrimeFactors)
     }
 }
 
-static std::string u128_to_string(__uint128_t v)
+static std::string big_to_string(Big v)
 {
-    if (v == 0) {
+    if (v.is_zero()) {
         return "0";
     }
     std::string s;
-    while (v > 0) {
-        uint32_t digit = (uint32_t)(v % 10);
+    while (!v.is_zero()) {
+        uint32_t digit = v.div_mod_u32_inplace(10u);
         s.push_back(char('0' + digit));
-        v /= 10;
     }
     std::reverse(s.begin(), s.end());
     return s;
+}
+
+static inline bool big_is_one_or_zero_divisor(uint64_t p) { return p <= 1ull; }
+
+static inline bool big_divisible_by_u32(const Big& n, uint32_t p)
+{
+    Big t = n;
+    return t.div_mod_u32_inplace(p) == 0u;
+}
+
+static inline void big_div_exact_u32_inplace(Big& n, uint32_t p)
+{
+    (void)n.div_mod_u32_inplace(p);
 }
 
 static void checkCuda(cudaError_t err, const char* what)
@@ -202,32 +219,45 @@ __device__ __forceinline__ uint32_t wheelGap510510(uint32_t i)
 }
 
 __global__
-void factorize_chunk(__uint128_t n,
-                     uint64_t sqrtn,
-                     uint64_t startWheelBlock,
-                     uint64_t endWheelBlock,
+void factorize_chunk(const Big* n,
+                     const Big* sqrtn,
+                     Big baseWheelBlock,
+                     uint64_t startWheelOffset,
+                     uint64_t endWheelOffset,
                      uint32_t* outCount,
-                     uint64_t* outDivisors,
+                     Big* outDivisors,
                      uint32_t outCapacity)
 {
     uint64_t idx = (uint64_t)blockIdx.x * (uint64_t)blockDim.x + (uint64_t)threadIdx.x;
     uint64_t stride = (uint64_t)gridDim.x * (uint64_t)blockDim.x;
 
-    for (uint64_t wheelBlock = startWheelBlock + idx; wheelBlock < endWheelBlock; wheelBlock += stride) {
-        __uint128_t value = (__uint128_t)wheelBlock * kWheelMod + 1;
+    const Big one = Big::from_u64(1ull);
+
+    for (uint64_t wheelOffset = startWheelOffset + idx; wheelOffset < endWheelOffset; wheelOffset += stride) {
+        Big wheelBlock = baseWheelBlock;
+        wheelBlock.add_u64_inplace(wheelOffset);
+
+        Big value = wheelBlock;
+        value.mul_u32_inplace(kWheelMod);
+        value.add_u32_inplace(1u);
+
         // One full wheel traversal covers exactly (wheelBlock*kWheelMod + 1) .. +kWheelMod.
         for (uint32_t i = 0; i < kWheelLen510510; ++i) {
-            if (value > sqrtn) {
+            if (value > *sqrtn) {
                 return;
             }
-            if (value > 1 && (n % value) == 0) {
-                uint32_t pos = atomicAdd(outCount, 1u);
-                if (pos < outCapacity) {
-                    outDivisors[pos] = (uint64_t)value;
+
+            if (value > one) {
+                Big r = bigu::mod_big(*n, value);
+                if (r.is_zero()) {
+                    uint32_t pos = atomicAdd(outCount, 1u);
+                    if (pos < outCapacity) {
+                        outDivisors[pos] = value;
+                    }
+                    return;
                 }
-                return;
             }
-            value += wheelGap510510(i);
+            value.add_u32_inplace(wheelGap510510(i));
         }
     }
 }
@@ -240,8 +270,8 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    __uint128_t N;
-    if (!parse_u128_dec(argv[1], N) || N < 2) {
+    Big N;
+    if (!parse_big_dec(argv[1], N) || (N < Big::from_u64(2ull))) {
         std::cerr << "Invalid input number: " << argv[1] << std::endl;
         return 2;
     }
@@ -260,105 +290,167 @@ int main(int argc, char** argv)
                                  cudaMemcpyHostToDevice),
               "cudaMemcpyToSymbol(dWheelGaps510510Packed)");
 
-    // CPU-side factorization loop.
-    std::vector<__uint128_t> factors;
-    __uint128_t remaining = N;
-
-    auto divide_out = [&](uint64_t p) {
-        while (p > 1 && (remaining % p) == 0) {
-            factors.push_back((__uint128_t)p);
-            remaining /= p;
-        }
-    };
-
-    // Always handle wheel primes on CPU; the wheel never tests them.
-    divide_out(2);
-    divide_out(3);
-    divide_out(5);
-    divide_out(7);
-    divide_out(11);
-    divide_out(13);
-    divide_out(17);
-
+    // Managed buffers used across factorization iterations.
     const int blockSize = 256;
-    const uint32_t outCapacity = 256; // max divisors to report per chunk (demo)
+    const uint32_t outCapacity = 64; // keep small; divisors are big structs
     uint32_t* outCount = nullptr;
-    uint64_t* outDivisors = nullptr;
+    Big* outDivisors = nullptr;
+    Big* dN = nullptr;
+    Big* dSqrtN = nullptr;
     checkCuda(cudaMallocManaged(&outCount, sizeof(uint32_t)), "cudaMallocManaged(outCount)");
-    checkCuda(cudaMallocManaged(&outDivisors, sizeof(uint64_t) * outCapacity), "cudaMallocManaged(outDivisors)");
+    checkCuda(cudaMallocManaged(&outDivisors, sizeof(Big) * outCapacity), "cudaMallocManaged(outDivisors)");
+    checkCuda(cudaMallocManaged(&dN, sizeof(Big)), "cudaMallocManaged(dN)");
+    checkCuda(cudaMallocManaged(&dSqrtN, sizeof(Big)), "cudaMallocManaged(dSqrtN)");
 
-    // Tune chunk size: make each thread process multiple wheel blocks per launch.
-    const uint32_t maxGridBlocks = 65535;
-    const uint32_t gridBlocksForChunk = 256; // fixed grid size for consistent occupancy
-    const uint64_t threadsPerLaunch = (uint64_t)gridBlocksForChunk * (uint64_t)blockSize;
-    const uint64_t wheelBlocksPerThread = 8; // each thread processes ~8 wheel blocks per launch
-    const uint64_t chunkWheelBlocks = threadsPerLaunch * wheelBlocksPerThread;
-
-    while (remaining > 1) {
-        uint64_t sqrtn = isqrt_u128(remaining);
-        uint64_t totalWheelBlocks = ceil_div_u128_to_u64((__uint128_t)sqrtn, (uint64_t)kWheelMod);
-
-        bool foundAny = false;
-        for (uint64_t start = 0; start < totalWheelBlocks && remaining > 1; start += chunkWheelBlocks) {
-            uint64_t end = std::min<uint64_t>(start + chunkWheelBlocks, totalWheelBlocks);
-
-            {
-                __uint128_t candLo = (__uint128_t)start * (__uint128_t)kWheelMod + 1;
-                __uint128_t candHi = (__uint128_t)end * (__uint128_t)kWheelMod;
-                std::cout << "\rScanning blocks [" << start << "," << end << ")"
-                          << " candidates ~[" << u128_to_string(candLo) << "," << u128_to_string(candHi) << "]"
-                          << " (rem=" << u128_to_string(remaining) << ")"
-                          << std::flush;
+    auto factor_big = [&](auto&& self, Big n, std::vector<Big>& outFactors) -> void {
+        // Fast path: use 64-bit factorization when possible.
+        uint64_t n64 = 0;
+        if (n.fits_u64(n64)) {
+            std::vector<uint64_t> pf;
+            factor_u64(n64, pf);
+            for (uint64_t p : pf) {
+                outFactors.push_back(Big::from_u64(p));
             }
+            return;
+        }
 
-            *outCount = 0;
-            // Ensure the GPU sees outCount reset before the kernel reads/writes it.
-            checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(pre-launch)");
+        Big remaining = n;
 
-            factorize_chunk<<<(uint32_t)std::min<uint64_t>(maxGridBlocks, gridBlocksForChunk), blockSize>>>(remaining, sqrtn, start, end, outCount, outDivisors, outCapacity);
-            checkCuda(cudaGetLastError(), "kernel launch");
-            checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(post-kernel)");
+        auto divide_out_u32 = [&](uint32_t p) {
+            while (!big_is_one_or_zero_divisor(p) && big_divisible_by_u32(remaining, p)) {
+                outFactors.push_back(Big::from_u64((uint64_t)p));
+                big_div_exact_u32_inplace(remaining, p);
+            }
+        };
 
-            std::cout << "\rScanned blocks [" << start << "," << end << ")"
-                      << " found " << *outCount << " divisors"
-                      << " (rem=" << u128_to_string(remaining) << ")"
-                      << std::endl;
-            
-            uint32_t found = *outCount;
-            if (found > 0) {
-                foundAny = true;
-                uint32_t toProcess = std::min(found, outCapacity);
-                for (uint32_t i = 0; i < toProcess; ++i) {
-                    uint64_t d = outDivisors[i];
-                    if (d > 1 && (remaining % d) == 0) {
-                        std::cout << "GPU found divisor: " << d << std::endl;
+        // Always handle wheel primes on CPU; the wheel never tests them.
+        divide_out_u32(2);
+        divide_out_u32(3);
+        divide_out_u32(5);
+        divide_out_u32(7);
+        divide_out_u32(11);
+        divide_out_u32(13);
+        divide_out_u32(17);
 
-                        // The GPU can return a composite divisor. Fully split it on the CPU,
-                        // and divide those prime factors out of the remaining value.
-                        std::vector<uint64_t> pf;
-                        factor_u64(d, pf);
-                        for (uint64_t p : pf) {
-                            divide_out(p);
+        const uint32_t maxGridBlocks = 65535;
+        const uint32_t gridBlocksForChunk = 256;
+        const uint64_t threadsPerLaunch = (uint64_t)gridBlocksForChunk * (uint64_t)blockSize;
+        const uint64_t wheelBlocksPerThread = 8;
+        const uint64_t chunkWheelBlocks = threadsPerLaunch * wheelBlocksPerThread;
+
+        const Big one = Big::from_u64(1ull);
+        const Big chunkBig = Big::from_u64(chunkWheelBlocks);
+
+        while (remaining > one) {
+            Big sqrtn = isqrt_big(remaining);
+            Big totalWheelBlocks = ceil_div_big_by_u32(sqrtn, kWheelMod);
+
+            bool foundAny = false;
+            Big start = Big::zero();
+            while (start < totalWheelBlocks && remaining > one) {
+                Big blocksLeft = totalWheelBlocks;
+                blocksLeft.sub_inplace(start);
+
+                uint64_t endOffset = chunkWheelBlocks;
+                if (blocksLeft < chunkBig) {
+                    // blocksLeft fits in u64 because it's < chunkWheelBlocks (u64).
+                    endOffset = blocksLeft.limb[0];
+                }
+
+                Big endBlock = start;
+                endBlock.add_u64_inplace(endOffset);
+
+                {
+                    Big candLo = start;
+                    candLo.mul_u32_inplace(kWheelMod);
+                    candLo.add_u32_inplace(1u);
+
+                    Big candHi = endBlock;
+                    candHi.mul_u32_inplace(kWheelMod);
+
+                    std::cout << "\rScanning blocks [" << big_to_string(start) << "," << big_to_string(endBlock) << ")"
+                              << " candidates ~[" << big_to_string(candLo) << "," << big_to_string(candHi) << "]"
+                              << " (rem=" << big_to_string(remaining) << ")"
+                              << std::flush;
+                }
+
+                *outCount = 0;
+                *dN = remaining;
+                *dSqrtN = sqrtn;
+                checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(pre-launch)");
+
+                factorize_chunk<<<(uint32_t)std::min<uint64_t>(maxGridBlocks, gridBlocksForChunk), blockSize>>>(
+                    dN,
+                    dSqrtN,
+                    start,
+                    0ull,
+                    endOffset,
+                    outCount,
+                    outDivisors,
+                    outCapacity);
+                checkCuda(cudaGetLastError(), "kernel launch");
+                checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(post-kernel)");
+
+                std::cout << "\rScanned blocks [" << big_to_string(start) << "," << big_to_string(endBlock) << ")"
+                          << " found " << *outCount << " divisors"
+                          << " (rem=" << big_to_string(remaining) << ")"
+                          << std::endl;
+
+                uint32_t found = *outCount;
+                if (found > 0) {
+                    uint32_t toProcess = std::min(found, outCapacity);
+                    for (uint32_t i = 0; i < toProcess; ++i) {
+                        Big d = outDivisors[i];
+                        Big r = bigu::mod_big(remaining, d);
+                        if (d > one && r.is_zero()) {
+                            foundAny = true;
+
+                            // Factor the divisor fully (it may be composite). If it divides multiple times,
+                            // repeat those prime factors for each division.
+                            std::vector<Big> divFactors;
+                            self(self, d, divFactors);
+
+                            while (true) {
+                                Big rr = bigu::mod_big(remaining, d);
+                                if (!rr.is_zero()) {
+                                    break;
+                                }
+                                for (const auto& pf : divFactors) {
+                                    outFactors.push_back(pf);
+                                }
+                                Big q, rem;
+                                bigu::div_mod_big(remaining, d, q, rem);
+                                remaining = q;
+                            }
+
+                            // Remaining changed; restart scanning from the beginning.
+                            break;
                         }
+                    }
+                    if (foundAny) {
+                        break;
                     }
                 }
 
-                // Remaining changed; restart scanning from the beginning.
+                start.add_u64_inplace(chunkWheelBlocks);
+            }
+
+            if (!foundAny) {
+                // No divisors <= sqrt(remaining) were found, so remaining is prime.
+                outFactors.push_back(remaining);
                 break;
             }
         }
+    };
 
-        if (!foundAny) {
-            // No divisors <= sqrt(remaining) were found, so remaining is prime.
-            factors.push_back(remaining);
-            remaining = 1;
-        }
+    std::vector<Big> factors;
+    factor_big(factor_big, N, factors);
+    for (const auto& f : factors) {
+        std::cout << "factor: " << big_to_string(f) << std::endl;
     }
 
-    for (auto f : factors) {
-        std::cout << "factor: " << u128_to_string(f) << std::endl;
-    }
-
+    checkCuda(cudaFree(dSqrtN), "cudaFree(dSqrtN)");
+    checkCuda(cudaFree(dN), "cudaFree(dN)");
     checkCuda(cudaFree(outDivisors), "cudaFree(outDivisors)");
     checkCuda(cudaFree(outCount), "cudaFree(outCount)");
     return 0;

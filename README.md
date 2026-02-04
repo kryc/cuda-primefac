@@ -9,12 +9,8 @@ The integer type used for N is a fixed-width multi-limb big integer (base 2^64) 
 ## Build
 
 ```bash
-sudo apt install nvidia-cuda-toolkit
-nvcc -std=c++20 -O2 primefactors.cu -o primefactors
 
-# Optional: set the bit-width (must be a multiple of 64).
-# Examples:
-#   -DPRIMEFAC_BITS=128  -> 2 limbs
+# (progress prints on one updating line)
 #   -DPRIMEFAC_BITS=256  -> 4 limbs
 #   -DPRIMEFAC_BITS=512  -> 8 limbs
 #   -DPRIMEFAC_BITS=1024 -> 16 limbs
@@ -26,6 +22,15 @@ nvcc -std=c++20 -O2 -DPRIMEFAC_BITS=256 primefactors.cu -o primefactors
 
 ```bash
 ./primefactors 213679575440397248358775931752856
+
+# Choose trial-division scan strategy (default: linear)
+./primefactors --strategy linear 213679575440397248358775931752856
+./primefactors --strategy random 213679575440397248358775931752856
+./primefactors --strategy mitm   213679575440397248358775931752856
+
+# Tune non-linear strategies without recompiling (values are in wheel-blocks)
+./primefactors --strategy random --warmup-blocks 8192 --strategy-chunk-blocks 4096 213679575440397248358775931752856
+
 Scanned blocks [0,524288) found 14 divisors (rem=26709946930049656044846991469107)46991469107)
 GPU found divisor: 53
 GPU found divisor: 2660113

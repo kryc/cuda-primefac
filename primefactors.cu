@@ -1,5 +1,7 @@
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
@@ -37,6 +39,93 @@ static void print_status_line(const std::string& msg)
     }
     std::cout << std::flush;
     lastLen = msg.size();
+}
+
+enum class TrialStrategy {
+    Linear,
+    Random,
+    MeetInTheMiddle,
+};
+
+static const char* strategy_name(TrialStrategy s)
+{
+    switch (s) {
+        case TrialStrategy::Linear:
+            return "linear";
+        case TrialStrategy::Random:
+            return "random";
+        case TrialStrategy::MeetInTheMiddle:
+            return "mitm";
+    }
+    return "linear";
+}
+
+static bool parse_strategy_arg(const std::string& s, TrialStrategy& out)
+{
+    if (s == "linear") {
+        out = TrialStrategy::Linear;
+        return true;
+    }
+    if (s == "random") {
+        out = TrialStrategy::Random;
+        return true;
+    }
+    if (s == "mitm" || s == "meet" || s == "meet-in-the-middle" || s == "meet_in_the_middle") {
+        out = TrialStrategy::MeetInTheMiddle;
+        return true;
+    }
+    return false;
+}
+
+static bool parse_u64_arg(const char* s, uint64_t& out)
+{
+    if (s == nullptr || *s == '\0') {
+        return false;
+    }
+    char* endp = nullptr;
+    unsigned long long v = std::strtoull(s, &endp, 10);
+    if (endp == s || *endp != '\0') {
+        return false;
+    }
+    out = (uint64_t)v;
+    return true;
+}
+
+static inline uint64_t splitmix64(uint64_t& x)
+{
+    uint64_t z = (x += 0x9e3779b97f4a7c15ull);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    return z ^ (z >> 31);
+}
+
+static Div random_offset_below(const Div& limit, uint64_t& rngState)
+{
+    Div r = Div::zero();
+    const uint32_t bl = limit.bit_length();
+    if (bl == 0) {
+        return r;
+    }
+
+    // Fill limbs with PRNG.
+    for (size_t i = 0; i < kDivLimbs; ++i) {
+        r.limb[i] = splitmix64(rngState);
+    }
+
+    // Mask to bit length of limit.
+    const uint32_t top = (bl - 1u) / 64u;
+    const uint32_t bitsInTop = bl - top * 64u;
+    const uint64_t mask = (bitsInTop == 64u) ? ~0ull : ((1ull << bitsInTop) - 1ull);
+    for (size_t i = (size_t)top + 1; i < kDivLimbs; ++i) {
+        r.limb[i] = 0;
+    }
+    r.limb[top] &= mask;
+
+    // Reduce (at most once) because r is in [0,2^bl).
+    if (r >= limit) {
+        r.sub_inplace(limit);
+    }
+    return r;
 }
 
 static long double big_to_long_double_approx(const Div& x)
@@ -343,15 +432,93 @@ void factorize_chunk(const Big* n,
  
 int main(int argc, char** argv)
 {
-    
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <N (decimal, >=2)>" << std::endl;
+    TrialStrategy strategy = TrialStrategy::Linear;
+    const char* nArg = nullptr;
+    uint64_t warmupBlocksOpt = 4096ull;
+    uint64_t strategyChunkBlocksOpt = 8192ull;
+
+    for (int i = 1; i < argc; ++i) {
+        const char* a = argv[i];
+        if (a == nullptr) continue;
+        if (std::strncmp(a, "--warmup-blocks", 15) == 0) {
+            const char* valp = nullptr;
+            if (a[15] == '=') {
+                valp = a + 16;
+            } else {
+                if (i + 1 >= argc) {
+                    std::cerr << "Missing value for --warmup-blocks" << std::endl;
+                    return 1;
+                }
+                valp = argv[++i];
+            }
+            uint64_t v = 0;
+            if (!parse_u64_arg(valp, v)) {
+                std::cerr << "Invalid --warmup-blocks value: " << valp << std::endl;
+                return 1;
+            }
+            warmupBlocksOpt = v;
+            continue;
+        }
+        if (std::strncmp(a, "--strategy-chunk-blocks", 22) == 0) {
+            const char* valp = nullptr;
+            if (a[22] == '=') {
+                valp = a + 23;
+            } else {
+                if (i + 1 >= argc) {
+                    std::cerr << "Missing value for --strategy-chunk-blocks" << std::endl;
+                    return 1;
+                }
+                valp = argv[++i];
+            }
+            uint64_t v = 0;
+            if (!parse_u64_arg(valp, v) || v == 0) {
+                std::cerr << "Invalid --strategy-chunk-blocks value: " << valp << " (must be >= 1)" << std::endl;
+                return 1;
+            }
+            strategyChunkBlocksOpt = v;
+            continue;
+        }
+        if (std::strncmp(a, "--strategy", 10) == 0) {
+            std::string val;
+            if (a[10] == '=') {
+                val = std::string(a + 11);
+            } else {
+                if (i + 1 >= argc) {
+                    std::cerr << "Missing value for --strategy" << std::endl;
+                    return 1;
+                }
+                val = std::string(argv[++i]);
+            }
+            if (!parse_strategy_arg(val, strategy)) {
+                std::cerr << "Invalid strategy: " << val << " (expected linear|random|mitm)" << std::endl;
+                return 1;
+            }
+            continue;
+        }
+        if (std::strncmp(a, "--", 2) == 0) {
+            std::cerr << "Unknown option: " << a << std::endl;
+            return 1;
+        }
+        if (nArg == nullptr) {
+            nArg = a;
+        } else {
+            std::cerr << "Unexpected extra argument: " << a << std::endl;
+            return 1;
+        }
+    }
+
+    if (nArg == nullptr) {
+        std::cerr << "Usage: " << argv[0]
+                  << " [--strategy linear|random|mitm]"
+                  << " [--warmup-blocks <wheelBlocks>]"
+                  << " [--strategy-chunk-blocks <wheelBlocks>]"
+                  << " <N (decimal, >=2)>" << std::endl;
         return 1;
     }
 
     Big N;
-    if (!parse_big_dec(argv[1], N) || (N < Big::from_u64(2ull))) {
-        std::cerr << "Invalid input number: " << argv[1] << std::endl;
+    if (!parse_big_dec(nArg, N) || (N < Big::from_u64(2ull))) {
+        std::cerr << "Invalid input number: " << nArg << std::endl;
         return 2;
     }
 
@@ -390,6 +557,7 @@ int main(int argc, char** argv)
         } guard(depth);
 
         const bool doLog = (depth == 1);
+        TrialStrategy localStrategy = strategy;
 
         // Fast path: use 64-bit factorization when possible.
         uint64_t n64 = 0;
@@ -403,6 +571,12 @@ int main(int argc, char** argv)
         }
 
         Big remaining = n;
+
+        // PRNG state for random strategy (deterministic per factoring call).
+        uint64_t rngState = 0x6a09e667f3bcc909ull;
+        rngState ^= remaining.limb[0];
+        if constexpr (kBigLimbs > 1) rngState ^= remaining.limb[1] * 0x9e3779b97f4a7c15ull;
+        if constexpr (kBigLimbs > 2) rngState ^= remaining.limb[2] * 0xbf58476d1ce4e5b9ull;
 
         auto divide_out_u32 = [&](uint32_t p) {
             while (!big_is_one_or_zero_divisor(p) && big_divisible_by_u32(remaining, p)) {
@@ -428,7 +602,6 @@ int main(int argc, char** argv)
 
         const Big one = Big::from_u64(1ull);
         const Div oneDiv = Div::from_u64(1ull);
-        const Div chunkDiv = Div::from_u64(chunkWheelBlocks);
 
         while (remaining > one) {
             Big sqrtnBig = isqrt_big(remaining);
@@ -436,25 +609,24 @@ int main(int argc, char** argv)
             Div totalWheelBlocks = ceil_div_by_u32(sqrtn, kWheelMod);
 
             bool foundAny = false;
-            Div start = Div::zero();
-            while (start < totalWheelBlocks && remaining > one) {
-                Div blocksLeft = totalWheelBlocks;
-                blocksLeft.sub_inplace(start);
 
-                uint64_t endOffset = chunkWheelBlocks;
-                if (blocksLeft < chunkDiv) {
-                    // blocksLeft fits in u64 because it's < chunkWheelBlocks (u64).
-                    endOffset = blocksLeft.limb[0];
-                }
+            // For strategies that spend time near sqrt(N) (large denominators), keep each launch smaller
+            // so we alternate more frequently and can bail out earlier.
+            const uint64_t chunkBlocksThisRound = (localStrategy == TrialStrategy::Linear)
+                                                      ? chunkWheelBlocks
+                                                      : std::min<uint64_t>(chunkWheelBlocks, strategyChunkBlocksOpt);
+            const Div chunkDiv = Div::from_u64(chunkBlocksThisRound);
 
-                Div endBlock = start;
+            auto run_chunk = [&](const Div& startBlock, uint64_t endOffset, Div& doneBlocks) -> bool {
+                Div endBlock = startBlock;
                 endBlock.add_u64_inplace(endOffset);
 
                 if (doLog) {
-                    const double pct = approx_percent_complete(endBlock, totalWheelBlocks);
+                    doneBlocks.add_u64_inplace(endOffset);
+                    const double pct = approx_percent_complete(doneBlocks, totalWheelBlocks);
                     std::ostringstream oss;
                     oss << std::fixed << std::setprecision(2) << pct << "% "
-                        << "blocks [" << uint_to_string(start) << "," << uint_to_string(endBlock) << ")/" << uint_to_string(totalWheelBlocks)
+                        << strategy_name(localStrategy) << " blocks [" << uint_to_string(startBlock) << "," << uint_to_string(endBlock) << ")/" << uint_to_string(totalWheelBlocks)
                         << " rem=" << uint_to_string(remaining);
                     print_status_line(oss.str());
                 }
@@ -467,7 +639,7 @@ int main(int argc, char** argv)
                 factorize_chunk<<<(uint32_t)std::min<uint64_t>(maxGridBlocks, gridBlocksForChunk), blockSize>>>(
                     dN,
                     dSqrtN,
-                    start,
+                    startBlock,
                     0ull,
                     endOffset,
                     outCount,
@@ -476,58 +648,159 @@ int main(int argc, char** argv)
                 checkCuda(cudaGetLastError(), "kernel launch");
                 checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(post-kernel)");
 
+                uint32_t found = *outCount;
                 if (doLog) {
-                    const double pct = approx_percent_complete(endBlock, totalWheelBlocks);
+                    const double pct = approx_percent_complete(doneBlocks, totalWheelBlocks);
                     std::ostringstream oss;
                     oss << std::fixed << std::setprecision(2) << pct << "% "
-                        << "blocks [" << uint_to_string(start) << "," << uint_to_string(endBlock) << ")/" << uint_to_string(totalWheelBlocks)
-                        << " found " << *outCount << " rem=" << uint_to_string(remaining);
+                        << strategy_name(localStrategy) << " blocks [" << uint_to_string(startBlock) << "," << uint_to_string(endBlock) << ")/" << uint_to_string(totalWheelBlocks)
+                        << " found " << found << " rem=" << uint_to_string(remaining);
                     print_status_line(oss.str());
                 }
 
-                uint32_t found = *outCount;
-                if (found > 0) {
-                    uint32_t toProcess = std::min(found, outCapacity);
-                    for (uint32_t i = 0; i < toProcess; ++i) {
-                        Div d = outDivisors[i];
-                        Div r = bigu::mod_fast<kBigLimbs, kDivLimbs>(remaining, d);
-                        if (d > oneDiv && r.is_zero()) {
-                            foundAny = true;
-
-                            // Factor the divisor fully (it may be composite). If it divides multiple times,
-                            // repeat those prime factors for each division.
-                            Big dBig = div_to_big_zext(d);
-                            std::vector<Big> divFactors;
-                            self(self, dBig, divFactors);
-
-                            bool firstDivision = true;
-                            while (true) {
-                                if (!firstDivision) {
-                                    Div rr = bigu::mod_fast<kBigLimbs, kDivLimbs>(remaining, d);
-                                    if (!rr.is_zero()) {
-                                        break;
-                                    }
-                                }
-                                firstDivision = false;
-                                for (const auto& pf : divFactors) {
-                                    outFactors.push_back(pf);
-                                }
-                                Big q;
-                                Div rem;
-                                bigu::div_mod_fast<kBigLimbs, kDivLimbs>(remaining, d, q, rem);
-                                remaining = q;
-                            }
-
-                            // Remaining changed; restart scanning from the beginning.
-                            break;
-                        }
-                    }
-                    if (foundAny) {
-                        break;
-                    }
+                if (found == 0) {
+                    return false;
                 }
 
-                start.add_u64_inplace(chunkWheelBlocks);
+                uint32_t toProcess = std::min(found, outCapacity);
+                for (uint32_t i = 0; i < toProcess; ++i) {
+                    Div d = outDivisors[i];
+                    Div r = bigu::mod_fast<kBigLimbs, kDivLimbs>(remaining, d);
+                    if (d > oneDiv && r.is_zero()) {
+                        // Factor the divisor fully (it may be composite). If it divides multiple times,
+                        // repeat those prime factors for each division.
+                        Big dBig = div_to_big_zext(d);
+                        std::vector<Big> divFactors;
+                        self(self, dBig, divFactors);
+
+                        bool firstDivision = true;
+                        while (true) {
+                            if (!firstDivision) {
+                                Div rr = bigu::mod_fast<kBigLimbs, kDivLimbs>(remaining, d);
+                                if (!rr.is_zero()) {
+                                    break;
+                                }
+                            }
+                            firstDivision = false;
+                            for (const auto& pf : divFactors) {
+                                outFactors.push_back(pf);
+                            }
+                            Big q;
+                            Div rem;
+                            bigu::div_mod_fast<kBigLimbs, kDivLimbs>(remaining, d, q, rem);
+                            remaining = q;
+                        }
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            auto chunk_len = [&](const Div& cur, const Div& limit) -> uint64_t {
+                Div blocksLeft = limit;
+                blocksLeft.sub_inplace(cur);
+                uint64_t endOffset = chunkBlocksThisRound;
+                if (blocksLeft < chunkDiv) {
+                    endOffset = blocksLeft.limb[0];
+                }
+                return endOffset;
+            };
+
+            Div doneBlocks = Div::zero();
+
+            // Warmup prefix scan for non-linear strategies: quickly catch small factors cheaply.
+            Div warmupLimit = Div::zero();
+            if (localStrategy != TrialStrategy::Linear) {
+                Div warmup = Div::from_u64(warmupBlocksOpt);
+                warmupLimit = (totalWheelBlocks < warmup) ? totalWheelBlocks : warmup;
+
+                Div cur = Div::zero();
+                while (cur < warmupLimit && remaining > one) {
+                    uint64_t endOffset = chunk_len(cur, warmupLimit);
+                    if (run_chunk(cur, endOffset, doneBlocks)) {
+                        foundAny = true;
+                        break;
+                    }
+                    cur.add_u64_inplace(endOffset);
+                }
+            }
+
+            if (foundAny) {
+                continue;
+            }
+
+            if (localStrategy == TrialStrategy::Linear) {
+                Div cur = Div::zero();
+                while (cur < totalWheelBlocks && remaining > one) {
+                    uint64_t endOffset = chunk_len(cur, totalWheelBlocks);
+                    if (run_chunk(cur, endOffset, doneBlocks)) {
+                        foundAny = true;
+                        break;
+                    }
+                    cur.add_u64_inplace(endOffset);
+                }
+            } else if (localStrategy == TrialStrategy::Random) {
+                Div start0 = Div::zero();
+                if (warmupLimit < totalWheelBlocks) {
+                    Div span = totalWheelBlocks;
+                    span.sub_inplace(warmupLimit);
+                    start0 = random_offset_below(span, rngState);
+                    start0.add_inplace(warmupLimit);
+                } else {
+                    start0 = Div::zero();
+                }
+
+                Div cur = start0;
+                while (cur < totalWheelBlocks && remaining > one) {
+                    uint64_t endOffset = chunk_len(cur, totalWheelBlocks);
+                    if (run_chunk(cur, endOffset, doneBlocks)) {
+                        foundAny = true;
+                        break;
+                    }
+                    cur.add_u64_inplace(endOffset);
+                }
+                if (!foundAny && (warmupLimit < start0)) {
+                    cur = warmupLimit;
+                    while (cur < start0 && remaining > one) {
+                        uint64_t endOffset = chunk_len(cur, start0);
+                        if (run_chunk(cur, endOffset, doneBlocks)) {
+                            foundAny = true;
+                            break;
+                        }
+                        cur.add_u64_inplace(endOffset);
+                    }
+                }
+            } else {
+                // Meet in the middle: alternate scanning near sqrt (end) and near 0 (begin).
+                Div low = warmupLimit;
+                Div high = totalWheelBlocks;
+                bool takeHigh = true;
+                while (low < high && remaining > one) {
+                    Div span = high;
+                    span.sub_inplace(low);
+                    uint64_t endOffset = chunkBlocksThisRound;
+                    if (span < chunkDiv) {
+                        endOffset = span.limb[0];
+                    }
+
+                    if (takeHigh) {
+                        Div startBlock = high;
+                        startBlock.sub_inplace(Div::from_u64(endOffset));
+                        if (run_chunk(startBlock, endOffset, doneBlocks)) {
+                            foundAny = true;
+                            break;
+                        }
+                        high = startBlock;
+                    } else {
+                        Div startBlock = low;
+                        if (run_chunk(startBlock, endOffset, doneBlocks)) {
+                            foundAny = true;
+                            break;
+                        }
+                        low.add_u64_inplace(endOffset);
+                    }
+                    takeHigh = !takeHigh;
+                }
             }
 
             if (!foundAny) {

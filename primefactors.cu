@@ -1,6 +1,5 @@
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -89,6 +88,12 @@ static bool parse_u64_arg(const char* s, uint64_t& out)
     }
     out = (uint64_t)v;
     return true;
+}
+
+static bool opt_is(const char* a, const char* opt)
+{
+    const size_t n = std::strlen(opt);
+    return std::strncmp(a, opt, n) == 0 && (a[n] == '\0' || a[n] == '=');
 }
 
 static inline uint64_t splitmix64(uint64_t& x)
@@ -442,7 +447,7 @@ int main(int argc, char** argv)
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
         if (a == nullptr) continue;
-        if (std::strncmp(a, "--warmup-blocks", 15) == 0) {
+        if (opt_is(a, "--warmup-blocks")) {
             const char* valp = nullptr;
             if (a[15] == '=') {
                 valp = a + 16;
@@ -461,7 +466,7 @@ int main(int argc, char** argv)
             warmupBlocksOpt = v;
             continue;
         }
-        if (std::strncmp(a, "--strategy-chunk-blocks", 22) == 0) {
+        if (opt_is(a, "--strategy-chunk-blocks")) {
             const char* valp = nullptr;
             if (a[22] == '=') {
                 valp = a + 23;
@@ -480,7 +485,7 @@ int main(int argc, char** argv)
             strategyChunkBlocksOpt = v;
             continue;
         }
-        if (std::strncmp(a, "--seed", 6) == 0) {
+        if (opt_is(a, "--seed")) {
             const char* valp = nullptr;
             if (a[6] == '=') {
                 valp = a + 7;
@@ -500,7 +505,7 @@ int main(int argc, char** argv)
             seedProvided = true;
             continue;
         }
-        if (std::strncmp(a, "--strategy", 10) == 0) {
+        if (opt_is(a, "--strategy")) {
             std::string val;
             if (a[10] == '=') {
                 val = std::string(a + 11);

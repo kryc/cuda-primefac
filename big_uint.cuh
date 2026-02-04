@@ -10,6 +10,16 @@
 #define __device__
 #endif
 
+#if !defined(__CUDA_ARCH__)
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunknown-pragmas"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunknown-pragmas"
+#endif
+#endif
+
 namespace bigu {
 
 __host__ __device__ static inline uint32_t clz_u64(uint64_t x)
@@ -819,142 +829,6 @@ __host__ __device__ static inline void div_mod_knuth(const BigUInt<NL>& numerato
 }
 
 template <size_t NL, size_t DL>
-__host__ __device__ static inline BigUInt<DL> mod_knuth_fixed_full(const BigUInt<NL>& numerator, const BigUInt<DL>& denom)
-{
-    // Fast path for common fixed-size cases where numerator and denom both use their full limb widths
-    // (i.e. top limbs are non-zero). Uses Knuth Algorithm D with fixed m=DL, n=NL.
-    static_assert(NL >= 2 && DL >= 2, "fixed division expects at least 2 limbs");
-
-    const size_t m = DL;
-    const size_t n = NL;
-
-    uint64_t v[DL];
-    uint64_t u[NL + 1];
-
-    const uint32_t s = clz_u64(denom.limb[m - 1]);
-
-    // Normalize v directly from denom.
-    if (s == 0) {
-#pragma unroll
-        for (size_t i = 0; i < DL; ++i) {
-            v[i] = denom.limb[i];
-        }
-    } else {
-        uint64_t carry = 0;
-#pragma unroll
-        for (size_t i = 0; i < DL; ++i) {
-            uint64_t w = denom.limb[i];
-            v[i] = (w << s) | carry;
-            carry = (w >> (64u - s));
-        }
-    }
-
-    // Normalize u directly from numerator, with u[n]=0.
-    if (s == 0) {
-#pragma unroll
-        for (size_t i = 0; i < NL; ++i) {
-            u[i] = numerator.limb[i];
-        }
-        u[NL] = 0;
-    } else {
-        uint64_t carry = 0;
-#pragma unroll
-        for (size_t i = 0; i < NL; ++i) {
-            uint64_t w = numerator.limb[i];
-            u[i] = (w << s) | carry;
-            carry = (w >> (64u - s));
-        }
-        u[NL] = carry;
-    }
-
-    const size_t jMax = n - m;
-    for (size_t jj = 0; jj <= jMax; ++jj) {
-        const size_t j = jMax - jj;
-
-        uint64_t rhat = 0;
-        uint64_t qhat = udiv128by64(u[j + m], u[j + m - 1], v[m - 1], rhat);
-
-        if (qhat != 0) {
-            while (true) {
-                uint64_t pHi, pLo;
-                mul_u64_u64(qhat, v[m - 2], pHi, pLo);
-                if (pHi < rhat) {
-                    break;
-                }
-                if (pHi > rhat || pLo > u[j + m - 2]) {
-                    qhat -= 1;
-                    uint64_t r2 = rhat + v[m - 1];
-                    if (r2 < rhat) {
-                        rhat = r2;
-                        break;
-                    }
-                    rhat = r2;
-                    continue;
-                }
-                break;
-            }
-        }
-
-        uint64_t borrow = 0;
-        uint64_t carryMul = 0;
-#pragma unroll
-        for (size_t i = 0; i < DL; ++i) {
-            uint64_t pHi, pLo;
-            mul_u64_u64(v[i], qhat, pHi, pLo);
-
-            uint64_t t = pLo + carryMul;
-            carryMul = pHi + ((t < pLo) ? 1ull : 0ull);
-
-            uint64_t uu = u[j + i];
-            uint64_t sub = uu - t;
-            uint64_t b1 = (sub > uu) ? 1ull : 0ull;
-            uint64_t sub2 = sub - borrow;
-            uint64_t b2 = (sub2 > sub) ? 1ull : 0ull;
-            u[j + i] = sub2;
-            borrow = (b1 | b2);
-        }
-
-        uint64_t uu = u[j + m];
-        uint64_t sub = uu - carryMul;
-        uint64_t b1 = (sub > uu) ? 1ull : 0ull;
-        uint64_t sub2 = sub - borrow;
-        uint64_t b2 = (sub2 > sub) ? 1ull : 0ull;
-        u[j + m] = sub2;
-
-        if ((b1 | b2) != 0) {
-            uint64_t c = 0;
-#pragma unroll
-            for (size_t i = 0; i < DL; ++i) {
-                uint64_t prev = u[j + i];
-                uint64_t sum = prev + v[i] + c;
-                c = (sum < prev) ? 1ull : 0ull;
-                if (c == 0 && sum < v[i]) c = 1ull;
-                u[j + i] = sum;
-            }
-            u[j + m] += c;
-        }
-    }
-
-    BigUInt<DL> rem = BigUInt<DL>::zero();
-    // Denormalize the low m limbs of u into rem.
-    if (s == 0) {
-#pragma unroll
-        for (size_t i = 0; i < DL; ++i) {
-            rem.limb[i] = u[i];
-        }
-    } else {
-        uint64_t carry = 0;
-        for (size_t ii = 0; ii < DL; ++ii) {
-            size_t i = DL - 1 - ii;
-            uint64_t w = u[i];
-            rem.limb[i] = (w >> s) | carry;
-            carry = (w << (64u - s));
-        }
-    }
-    return rem;
-}
-
-template <size_t NL, size_t DL>
 __host__ __device__ static inline BigUInt<DL> mod_knuth_fixed_full_streaming(const BigUInt<NL>& numerator,
                                                                             const BigUInt<DL>& denom)
 {
@@ -1443,3 +1317,11 @@ __host__ __device__ static inline BigUInt<LIMBS> isqrt_big(const BigUInt<LIMBS>&
 }
 
 } // namespace bigu
+
+#if !defined(__CUDA_ARCH__)
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+#endif

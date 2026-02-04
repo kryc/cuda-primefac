@@ -439,11 +439,15 @@ int main(int argc, char** argv)
                             std::vector<Big> divFactors;
                             self(self, dBig, divFactors);
 
+                            bool firstDivision = true;
                             while (true) {
-                                Div rr = bigu::mod_fast<kBigLimbs, kDivLimbs>(remaining, d);
-                                if (!rr.is_zero()) {
-                                    break;
+                                if (!firstDivision) {
+                                    Div rr = bigu::mod_fast<kBigLimbs, kDivLimbs>(remaining, d);
+                                    if (!rr.is_zero()) {
+                                        break;
+                                    }
                                 }
+                                firstDivision = false;
                                 for (const auto& pf : divFactors) {
                                     outFactors.push_back(pf);
                                 }

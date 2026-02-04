@@ -23,6 +23,11 @@ __host__ __device__ static inline uint32_t clz_u64(uint64_t x)
 
 __host__ __device__ static inline void mul_u64_u64(uint64_t a, uint64_t b, uint64_t& hi, uint64_t& lo)
 {
+    // 64x64 -> 128.
+#if defined(__CUDA_ARCH__)
+    lo = (uint64_t)((unsigned long long)a * (unsigned long long)b);
+    hi = (uint64_t)__umul64hi((unsigned long long)a, (unsigned long long)b);
+#else
     // Portable 64x64 -> 128 using 32-bit partial products.
     const uint64_t a0 = (uint64_t)(uint32_t)a;
     const uint64_t a1 = a >> 32;
@@ -38,8 +43,10 @@ __host__ __device__ static inline void mul_u64_u64(uint64_t a, uint64_t b, uint6
 
     lo = (p00 & 0xffffffffull) | (middle << 32);
     hi = p11 + (p01 >> 32) + (p10 >> 32) + (middle >> 32);
+#endif
 }
 
+template <size_t NL>
 __host__ __device__ static inline uint64_t shl64(uint64_t x, uint32_t s)
 {
     return (s == 0) ? x : (x << s);
@@ -460,6 +467,39 @@ struct BigUInt {
         return (uint32_t)rem;
     }
 };
+
+template <size_t NL>
+__host__ __device__ static inline uint64_t mod_u64(const BigUInt<NL>& numerator, uint64_t d)
+{
+    if (d == 0) return 0;
+    uint64_t rem = 0;
+    for (size_t i = NL; i-- > 0;) {
+        uint64_t rr;
+        (void)udiv128by64(rem, numerator.limb[i], d, rr);
+        rem = rr;
+    }
+    return rem;
+}
+
+template <size_t NL>
+__host__ __device__ static inline void div_mod_u64(const BigUInt<NL>& numerator,
+                                                   uint64_t d,
+                                                   BigUInt<NL>& quotient,
+                                                   uint64_t& remainder)
+{
+    quotient = BigUInt<NL>::zero();
+    remainder = 0;
+    if (d == 0) return;
+
+    uint64_t rem = 0;
+    for (size_t i = NL; i-- > 0;) {
+        uint64_t rr;
+        uint64_t q = udiv128by64(rem, numerator.limb[i], d, rr);
+        quotient.limb[i] = q;
+        rem = rr;
+    }
+    remainder = rem;
+}
 
 template <size_t NL, size_t DL>
 __host__ __device__ static inline BigUInt<DL> mod_knuth(const BigUInt<NL>& numerator, const BigUInt<DL>& denom)
@@ -915,6 +955,145 @@ __host__ __device__ static inline BigUInt<DL> mod_knuth_fixed_full(const BigUInt
 }
 
 template <size_t NL, size_t DL>
+__host__ __device__ static inline BigUInt<DL> mod_knuth_fixed_full_streaming(const BigUInt<NL>& numerator,
+                                                                            const BigUInt<DL>& denom)
+{
+    // Fixed-size remainder using a sliding (m+1)-limb window over u, to reduce scratch.
+    // Preconditions: numerator.limb[NL-1] != 0 and denom.limb[DL-1] != 0.
+    static_assert(NL >= 2 && DL >= 2, "fixed division expects at least 2 limbs");
+
+    const size_t m = DL;
+    const size_t n = NL;
+
+    uint64_t v[DL];
+    uint64_t uwin[DL + 1];
+
+    const uint32_t s = clz_u64(denom.limb[m - 1]);
+    const uint32_t rs = (s == 0) ? 0u : (64u - s);
+
+    auto den_norm = [&](size_t i) -> uint64_t {
+        if (s == 0) return denom.limb[i];
+        if (i == 0) return denom.limb[0] << s;
+        return (denom.limb[i] << s) | (denom.limb[i - 1] >> rs);
+    };
+    auto num_norm = [&](size_t i) -> uint64_t {
+        if (s == 0) {
+            if (i == n) return 0ull;
+            return numerator.limb[i];
+        }
+        if (i == 0) return numerator.limb[0] << s;
+        if (i < n) return (numerator.limb[i] << s) | (numerator.limb[i - 1] >> rs);
+        // i==n
+        return numerator.limb[n - 1] >> rs;
+    };
+
+#pragma unroll
+    for (size_t i = 0; i < DL; ++i) {
+        v[i] = den_norm(i);
+    }
+
+    const size_t jMax = n - m;
+
+    // Initialize window to u[jMax..jMax+m] == u[n-m..n].
+#pragma unroll
+    for (size_t i = 0; i < DL + 1; ++i) {
+        uwin[i] = num_norm(jMax + i);
+    }
+
+    for (size_t jj = 0; jj <= jMax; ++jj) {
+        const size_t j = jMax - jj;
+
+        uint64_t rhat = 0;
+        uint64_t qhat = udiv128by64(uwin[m], uwin[m - 1], v[m - 1], rhat);
+
+        if (qhat != 0) {
+            while (true) {
+                uint64_t pHi, pLo;
+                mul_u64_u64(qhat, v[m - 2], pHi, pLo);
+                if (pHi < rhat) break;
+                if (pHi > rhat || pLo > uwin[m - 2]) {
+                    qhat -= 1;
+                    uint64_t r2 = rhat + v[m - 1];
+                    if (r2 < rhat) {
+                        rhat = r2;
+                        break;
+                    }
+                    rhat = r2;
+                    continue;
+                }
+                break;
+            }
+        }
+
+        uint64_t borrow = 0;
+        uint64_t carryMul = 0;
+#pragma unroll
+        for (size_t i = 0; i < DL; ++i) {
+            uint64_t pHi, pLo;
+            mul_u64_u64(v[i], qhat, pHi, pLo);
+
+            uint64_t t = pLo + carryMul;
+            carryMul = pHi + ((t < pLo) ? 1ull : 0ull);
+
+            uint64_t uu = uwin[i];
+            uint64_t sub = uu - t;
+            uint64_t b1 = (sub > uu) ? 1ull : 0ull;
+            uint64_t sub2 = sub - borrow;
+            uint64_t b2 = (sub2 > sub) ? 1ull : 0ull;
+            uwin[i] = sub2;
+            borrow = (b1 | b2);
+        }
+
+        {
+            uint64_t uu = uwin[m];
+            uint64_t sub = uu - carryMul;
+            uint64_t b1 = (sub > uu) ? 1ull : 0ull;
+            uint64_t sub2 = sub - borrow;
+            uint64_t b2 = (sub2 > sub) ? 1ull : 0ull;
+            uwin[m] = sub2;
+
+            if ((b1 | b2) != 0) {
+                uint64_t c = 0;
+#pragma unroll
+                for (size_t i = 0; i < DL; ++i) {
+                    uint64_t prev = uwin[i];
+                    uint64_t sum = prev + v[i] + c;
+                    c = (sum < prev) ? 1ull : 0ull;
+                    if (c == 0 && sum < v[i]) c = 1ull;
+                    uwin[i] = sum;
+                }
+                uwin[m] += c;
+            }
+        }
+
+        if (j > 0) {
+#pragma unroll
+            for (size_t i = DL; i-- > 0;) {
+                uwin[i + 1] = uwin[i];
+            }
+            uwin[0] = num_norm(j - 1);
+        }
+    }
+
+    BigUInt<DL> rem = BigUInt<DL>::zero();
+    if (s == 0) {
+#pragma unroll
+        for (size_t i = 0; i < DL; ++i) {
+            rem.limb[i] = uwin[i];
+        }
+        return rem;
+    }
+
+    // Denormalize: shift right by s within the m-limb remainder (do NOT use uwin[m]).
+#pragma unroll
+    for (size_t i = 0; i < DL; ++i) {
+        uint64_t hi = (i + 1 < DL) ? uwin[i + 1] : 0ull;
+        rem.limb[i] = (uwin[i] >> s) | (hi << rs);
+    }
+    return rem;
+}
+
+template <size_t NL, size_t DL>
 __host__ __device__ static inline void div_mod_knuth_fixed_full(const BigUInt<NL>& numerator,
                                                                 const BigUInt<DL>& denom,
                                                                 BigUInt<NL>& quotient,
@@ -1047,11 +1226,28 @@ __host__ __device__ static inline BigUInt<DL> mod_fast(const BigUInt<NL>& numera
 {
     // Dispatch to a fixed-size fast path for common widths, otherwise fall back to generic.
     // The fixed-size path requires full-width top limbs non-zero.
+    // Extra fast path: denom fits in u64 (very common early in trial division).
+
+    bool denomFitsU64 = true;
+    for (size_t i = 1; i < DL; ++i) {
+        if (denom.limb[i] != 0ull) {
+            denomFitsU64 = false;
+            break;
+        }
+    }
+    if (denomFitsU64) {
+        const uint64_t d = denom.limb[0];
+        const uint64_t r = mod_u64(numerator, d);
+        BigUInt<DL> out = BigUInt<DL>::zero();
+        out.limb[0] = r;
+        return out;
+    }
+
     const bool full = (numerator.limb[NL - 1] != 0ull) && (denom.limb[DL - 1] != 0ull);
 
     if constexpr ((NL == 32 && DL == 16) || (NL == 16 && DL == 8) || (NL == 8 && DL == 4) || (NL == 4 && DL == 2)) {
         if (full) {
-            return mod_knuth_fixed_full<NL, DL>(numerator, denom);
+            return mod_knuth_fixed_full_streaming<NL, DL>(numerator, denom);
         }
     }
     return mod_knuth<NL, DL>(numerator, denom);
@@ -1063,6 +1259,22 @@ __host__ __device__ static inline void div_mod_fast(const BigUInt<NL>& numerator
                                                     BigUInt<NL>& quotient,
                                                     BigUInt<DL>& remainder)
 {
+    bool denomFitsU64 = true;
+    for (size_t i = 1; i < DL; ++i) {
+        if (denom.limb[i] != 0ull) {
+            denomFitsU64 = false;
+            break;
+        }
+    }
+    if (denomFitsU64) {
+        const uint64_t d = denom.limb[0];
+        uint64_t rem = 0;
+        div_mod_u64(numerator, d, quotient, rem);
+        remainder = BigUInt<DL>::zero();
+        remainder.limb[0] = rem;
+        return;
+    }
+
     const bool full = (numerator.limb[NL - 1] != 0ull) && (denom.limb[DL - 1] != 0ull);
 
     if constexpr ((NL == 32 && DL == 16) || (NL == 16 && DL == 8) || (NL == 8 && DL == 4) || (NL == 4 && DL == 2)) {

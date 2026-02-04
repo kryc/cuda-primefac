@@ -571,6 +571,18 @@ int main(int argc, char** argv)
 
         Big remaining = n;
 
+        // Fixed field widths for status output so the progress line doesn't visually jitter.
+        // Compute once per top-level factoring call.
+        size_t statusRemWidth = 0;
+        size_t statusBlocksWidth = 0;
+        if (doLog) {
+            statusRemWidth = big_to_string(n).size();
+            Big sq0 = isqrt_big(remaining);
+            Div sq0d = big_to_div_trunc(sq0);
+            Div twb0 = ceil_div_by_u32(sq0d, kWheelMod);
+            statusBlocksWidth = uint_to_string(twb0).size();
+        }
+
         // PRNG state for random strategy (deterministic per factoring call).
         uint64_t rngState = seedProvided ? seedOpt : 0x6a09e667f3bcc909ull;
         // Mix in the current remaining so different inputs still produce different sequences,
@@ -628,9 +640,12 @@ int main(int argc, char** argv)
                 if (doLog) {
                     const double pct = approx_percent_complete(doneBlocks, totalWheelBlocks);
                     std::ostringstream oss;
-                    oss << std::fixed << std::setprecision(2) << pct << "% "
-                        << strategy_name(localStrategy) << " blocks [" << uint_to_string(startBlock) << "," << uint_to_string(endBlock) << ")/" << uint_to_string(totalWheelBlocks)
-                        << " rem=" << uint_to_string(remaining);
+                    oss << std::setw(6) << std::fixed << std::setprecision(2) << pct << "% "
+                        << strategy_name(localStrategy) << " blocks ["
+                        << std::setw(statusBlocksWidth) << uint_to_string(startBlock) << ","
+                        << std::setw(statusBlocksWidth) << uint_to_string(endBlock) << ")/"
+                        << std::setw(statusBlocksWidth) << uint_to_string(totalWheelBlocks)
+                        << " rem=" << std::setw(statusRemWidth) << uint_to_string(remaining);
                     print_status_line(oss.str());
                 }
 
@@ -655,9 +670,13 @@ int main(int argc, char** argv)
                 if (doLog) {
                     const double pct = approx_percent_complete(doneBlocks, totalWheelBlocks);
                     std::ostringstream oss;
-                    oss << std::fixed << std::setprecision(2) << pct << "% "
-                        << strategy_name(localStrategy) << " blocks [" << uint_to_string(startBlock) << "," << uint_to_string(endBlock) << ")/" << uint_to_string(totalWheelBlocks)
-                        << " found " << found << " rem=" << uint_to_string(remaining);
+                    oss << std::setw(6) << std::fixed << std::setprecision(2) << pct << "% "
+                        << strategy_name(localStrategy) << " blocks ["
+                        << std::setw(statusBlocksWidth) << uint_to_string(startBlock) << ","
+                        << std::setw(statusBlocksWidth) << uint_to_string(endBlock) << ")/"
+                        << std::setw(statusBlocksWidth) << uint_to_string(totalWheelBlocks)
+                        << " found " << std::setw(3) << found
+                        << " rem=" << std::setw(statusRemWidth) << uint_to_string(remaining);
                     print_status_line(oss.str());
                 }
 
